@@ -3,5 +3,5 @@ dist/
 state/
 .env
 *.tgz
-hdfs.exe
+record2s3.exe
 sea-prep.blob

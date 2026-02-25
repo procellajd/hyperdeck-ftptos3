@@ -232,7 +232,7 @@ async function runBrowse(ftpHost?: string): Promise<void> {
 const program = new Command();
 
 program
-  .name('hdfs')
+  .name('record2s3')
   .description('Stream files from HyperDeck FTP directly to S3-compatible or local storage')
   .version('1.0.0')
   .action(async () => {
