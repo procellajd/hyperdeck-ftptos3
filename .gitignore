@@ -1,0 +1,7 @@
+node_modules/
+dist/
+state/
+.env
+*.tgz
+hdfs.exe
+sea-prep.blob
