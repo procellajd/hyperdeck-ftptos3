@@ -12,7 +12,7 @@ export class ProgressReporter {
   private lastReportedUploaded: number = 0;
   private lastReportedDownloaded: number = 0;
   private lastReportTime: number = 0;
-  private lineActive: boolean = false;
+  private linesWritten: number = 0;
   private downloadCounter: (() => number) | null = null;
 
   constructor(intervalMs: number) {
@@ -35,7 +35,7 @@ export class ProgressReporter {
     this.lastReportedUploaded = this.bytesUploaded;
     this.lastReportedDownloaded = this.bytesUploaded;
     this.lastReportTime = this.startTime;
-    this.lineActive = false;
+    this.linesWritten = 0;
 
     this.stop();
     this.timer = setInterval(() => this.report(), this.intervalMs);
@@ -60,9 +60,9 @@ export class ProgressReporter {
       clearInterval(this.timer);
       this.timer = null;
     }
-    if (this.lineActive) {
-      process.stdout.write('\n\n');
-      this.lineActive = false;
+    if (this.linesWritten > 0) {
+      process.stdout.write('\n');
+      this.linesWritten = 0;
     }
     this.downloadCounter = null;
   }
@@ -128,11 +128,21 @@ export class ProgressReporter {
     const avgStr = padLeft(formatMbps(avgSpeed), 10);
 
     const stats = `  ${bar} ${pct.padStart(5)}%  ${transferred}/${total}  DL:${dlStr}  UL:${ulStr}  Avg:${avgStr}  ETA: ${eta}  [${elapsed}]  Parts: ${p.partsCompleted}/${p.totalParts}`;
-    const controls = `\x1b[2m  Ctrl+C/q: pause | a: abort | Ctrl+C x2: force quit\x1b[0m`;
+    const controls = `  Ctrl+C/q: pause | a: abort | Ctrl+C x2: force quit`;
 
-    // Overwrite two lines in-place: stats + controls
-    process.stdout.write(`\r\x1b[K${stats}\n\x1b[K${controls}\x1b[A\r`);
-    this.lineActive = true;
+    // Calculate how many visual lines each string occupies when wrapped
+    const cols = process.stdout.columns || 80;
+    const visualLines = (text: string) => Math.max(1, Math.ceil(text.length / cols));
+
+    // Move cursor up to overwrite previous output
+    if (this.linesWritten > 0) {
+      process.stdout.write(`\x1b[${this.linesWritten}A`);
+    }
+
+    // Write stats + controls, clearing each line
+    const totalLines = visualLines(stats) + visualLines(controls);
+    process.stdout.write(`\r\x1b[J${stats}\n\x1b[2m${controls}\x1b[0m`);
+    this.linesWritten = totalLines;
   }
 }
 
