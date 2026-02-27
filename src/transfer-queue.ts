@@ -1,5 +1,6 @@
 import { TransferManager } from './transfer-manager.js';
 import { setupInteractiveControls } from './cli.js';
+import { log } from './logger.js';
 import type { BrowseEntry } from './file-browser.js';
 import type { AppConfig } from './types.js';
 
@@ -7,6 +8,7 @@ export interface QueueResult {
   completed: string[];
   failed: { file: string; error: string }[];
   skipped: string[];
+  paused: boolean;
 }
 
 export async function executeTransferQueue(
@@ -17,6 +19,7 @@ export async function executeTransferQueue(
     completed: [],
     failed: [],
     skipped: [],
+    paused: false,
   };
 
   let paused = false;
@@ -29,25 +32,31 @@ export async function executeTransferQueue(
 
     const file = files[i];
     console.log(`\n[${i + 1}/${files.length}] Transferring: ${file.name} (${formatBytes(file.size)})`);
+    log(`Queue [${i + 1}/${files.length}]: starting ${file.name} (${file.size} bytes) ftpPath=${file.ftpPath}`);
 
     // Fresh TransferManager per file to avoid stale aborted flag
     const manager = new TransferManager(config);
     const cleanup = setupInteractiveControls(manager);
 
     try {
-      await manager.transfer(file.ftpPath);
-      result.completed.push(file.name);
+      const state = await manager.transfer(file.ftpPath);
+      log(`Queue [${i + 1}/${files.length}]: transfer returned status=${state.status}`);
+      if (state.status === 'completed') {
+        result.completed.push(file.name);
+      } else if (state.status === 'in_progress') {
+        // Paused by user — stop queue, return to caller
+        paused = true;
+        result.paused = true;
+      } else {
+        // Aborted (cancelled) — stop queue, return to caller
+        paused = true;
+        result.paused = true;
+      }
     } catch (err) {
       const message = (err as Error).message;
-      // Check if this was a pause-triggered abort
-      if (message.includes('paused') || message.includes('aborted')) {
-        paused = true;
-        result.skipped.push(file.name);
-        // Remaining files will be added as skipped by the loop
-      } else {
-        console.error(`Failed: ${message}`);
-        result.failed.push({ file: file.name, error: message });
-      }
+      log(`Queue [${i + 1}/${files.length}]: transfer threw: ${message}`);
+      console.error(`Failed: ${message}`);
+      result.failed.push({ file: file.name, error: message });
     } finally {
       cleanup();
     }

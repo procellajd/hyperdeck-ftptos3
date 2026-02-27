@@ -5,6 +5,7 @@ export interface FtpConfig {
   password: string;
   timeout: number;
   keepalive: number;
+  maxRetries: number;
 }
 
 export interface S3Config {
@@ -82,6 +83,10 @@ export interface HyperDeckClip {
   format: string;
   duration: string;
   slot: number;
+  startTimecode?: string;
+  fileSize?: number;
+  container?: string;
+  filePath?: string;
 }
 
 export interface HyperDeckDeviceInfo {

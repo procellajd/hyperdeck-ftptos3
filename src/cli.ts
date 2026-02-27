@@ -5,13 +5,36 @@ import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig } from './config.js';
 import { TransferManager } from './transfer-manager.js';
-import { HyperDeckClient } from './hyperdeck-client.js';
+import { HyperDeckClient, type SlotStats } from './hyperdeck-client.js';
 import { FtpClient } from './ftp-client.js';
 import { StateManager } from './state-manager.js';
 import { discoverFiles } from './file-browser.js';
 import { interactiveSelect } from './interactive-select.js';
 import { executeTransferQueue } from './transfer-queue.js';
+import { log, logToFile } from './logger.js';
+import type { BrowseEntry } from './file-browser.js';
 import type { DestinationType } from './types.js';
+
+// Safety net: catch any truly unhandled errors so the process never silently exits
+process.on('uncaughtException', (err) => {
+  logToFile('FATAL', `Uncaught exception: ${err.message}`, err.stack);
+  console.error(`[FATAL] Uncaught exception: ${err.message}`);
+  if (err.stack) console.error(err.stack);
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (reason) => {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  const stack = reason instanceof Error ? reason.stack : undefined;
+  logToFile('FATAL', `Unhandled rejection: ${msg}`, stack);
+  console.error(`[FATAL] Unhandled rejection: ${msg}`);
+  if (stack) console.error(stack);
+  process.exit(1);
+});
+
+process.on('exit', (code) => {
+  logToFile('INFO', `Process exiting with code ${code}`);
+});
 
 function askQuestion(prompt: string): Promise<string> {
   const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -140,6 +163,179 @@ function saveEnvChanges(): void {
   envChanges.clear();
 }
 
+interface ClipMeta {
+  codec: string;
+  videoFormat: string;
+  startTimecode: string;
+  duration: string;
+}
+
+/** REST API response types for HyperDeck HTTP interface */
+interface RestClip {
+  codecName: string;
+  frameRate: string;
+  videoFormat: string;
+  startTimecode: string;
+  duration: string;
+  name: string;
+  fileSize?: number;
+}
+
+interface RestDeviceClipsResponse {
+  clips: RestClip[];
+}
+
+interface RestWorkingSetDevice {
+  name: string;
+  clipCount: number;
+}
+
+interface RestWorkingSetResponse {
+  devices: RestWorkingSetDevice[];
+}
+
+/**
+ * Fetch clip metadata from HyperDeck REST API (HTTP port 80).
+ * Uses GET /media/workingset to discover device names, then
+ * GET /clips/devices/{deviceName} for per-clip structured JSON.
+ * Best-effort with 5s timeout — returns empty map on any error.
+ */
+async function fetchClipMetadata(host: string): Promise<Map<string, ClipMeta>> {
+  const result = new Map<string, ClipMeta>();
+  const baseUrl = `http://${host}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+
+  try {
+    // Discover device names (one per slot with media)
+    const wsResp = await fetch(`${baseUrl}/media/workingset`, { signal: controller.signal });
+    if (!wsResp.ok) {
+      log(`fetchClipMetadata: /media/workingset returned ${wsResp.status}`);
+      return result;
+    }
+
+    const workingSet: RestWorkingSetResponse = await wsResp.json() as RestWorkingSetResponse;
+    const devices = (workingSet.devices ?? []).filter(d => d.clipCount > 0);
+
+    if (devices.length === 0) {
+      log('fetchClipMetadata: no devices with clips in working set');
+      return result;
+    }
+
+    log(`fetchClipMetadata: found ${devices.length} device(s): [${devices.map(d => d.name).join(', ')}]`);
+
+    // Fetch clips for each device
+    for (const device of devices) {
+      try {
+        const clipsResp = await fetch(
+          `${baseUrl}/clips/devices/${encodeURIComponent(device.name)}`,
+          { signal: controller.signal },
+        );
+        if (!clipsResp.ok) {
+          log(`fetchClipMetadata: /clips/devices/${device.name} returned ${clipsResp.status}`);
+          continue;
+        }
+
+        const body: RestDeviceClipsResponse = await clipsResp.json() as RestDeviceClipsResponse;
+
+        for (const clip of body.clips ?? []) {
+          result.set(clip.name, {
+            codec: clip.codecName ?? '',
+            videoFormat: clip.videoFormat ?? '',
+            startTimecode: clip.startTimecode ?? '',
+            duration: clip.duration ?? '',
+          });
+        }
+      } catch (err) {
+        log(`fetchClipMetadata: error fetching clips for ${device.name}: ${(err as Error).message}`);
+      }
+    }
+
+    log(`fetchClipMetadata: collected metadata for ${result.size} clips`);
+  } catch (err) {
+    if ((err as Error).name === 'AbortError') {
+      log('fetchClipMetadata: 5s timeout reached');
+    } else {
+      log(`fetchClipMetadata: error: ${(err as Error).message}`);
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+
+  return result;
+}
+
+/**
+ * Fetch clip metadata via HyperDeck TCP protocol (port 9993).
+ * Used as fallback when REST API returns no results.
+ * Groups entries by slot, connects once, fetches disk list + clip info + slot stats.
+ */
+async function fetchClipMetadataTcp(
+  host: string,
+  entries: BrowseEntry[],
+): Promise<{ metadata: Map<string, ClipMeta>; slotStats: Map<string, SlotStats> }> {
+  const metadata = new Map<string, ClipMeta>();
+  const slotStats = new Map<string, SlotStats>();
+
+  const client = new HyperDeckClient(host);
+
+  try {
+    await client.connect();
+    const deviceInfo = await client.getDeviceInfo();
+
+    // Build a map from volume name → slot id
+    const volumeToSlotId = new Map<string, number>();
+    for (const slot of deviceInfo.slots) {
+      if (slot.volumeName) {
+        volumeToSlotId.set(slot.volumeName, slot.slotId);
+      }
+    }
+
+    // Group entries by slot name
+    const slotGroups = new Map<string, Set<string>>();
+    for (const entry of entries) {
+      if (!slotGroups.has(entry.slot)) slotGroups.set(entry.slot, new Set());
+      slotGroups.get(entry.slot)!.add(entry.name);
+    }
+
+    for (const [slotName, clipNames] of slotGroups) {
+      const slotId = volumeToSlotId.get(slotName);
+      if (slotId === undefined) {
+        log(`fetchClipMetadataTcp: no slot id for volume "${slotName}"`);
+        continue;
+      }
+
+      // Get clip metadata
+      try {
+        const clipMeta = await client.getClipMeta(slotId, clipNames);
+        for (const [name, meta] of clipMeta) {
+          metadata.set(name, meta);
+        }
+        log(`fetchClipMetadataTcp: slot ${slotId} (${slotName}) → ${clipMeta.size} clips`);
+      } catch (err) {
+        log(`fetchClipMetadataTcp: getClipMeta failed for slot ${slotId}: ${(err as Error).message}`);
+      }
+
+      // Get slot stats
+      try {
+        const stats = await client.getSlotStats(slotId);
+        if (stats) {
+          slotStats.set(slotName, stats);
+          log(`fetchClipMetadataTcp: slot ${slotId} stats — ${stats.remainingSize} remaining`);
+        }
+      } catch (err) {
+        log(`fetchClipMetadataTcp: getSlotStats failed for slot ${slotId}: ${(err as Error).message}`);
+      }
+    }
+  } catch (err) {
+    log(`fetchClipMetadataTcp: connection error: ${(err as Error).message}`);
+  } finally {
+    await client.close();
+  }
+
+  return { metadata, slotStats };
+}
+
 async function runBrowse(ftpHost?: string): Promise<void> {
   console.log('--- Connection Setup ---\n');
 
@@ -207,7 +403,41 @@ async function runBrowse(ftpHost?: string): Promise<void> {
       return;
     }
 
-    const result = await interactiveSelect(entries);
+    // Enrich entries with clip metadata from HyperDeck REST API (best-effort)
+    let metadata = new Map<string, ClipMeta>();
+    let slotStats = new Map<string, SlotStats>();
+    try {
+      metadata = await fetchClipMetadata(config.ftp.host);
+      log(`fetchClipMetadata returned ${metadata.size} clips: [${[...metadata.keys()].join(', ')}]`);
+    } catch (err) {
+      log(`fetchClipMetadata threw unexpectedly: ${(err as Error).message}`);
+    }
+
+    // TCP fallback when REST returns no results (e.g. /media/workingset 404)
+    if (metadata.size === 0) {
+      log('REST metadata empty — falling back to TCP protocol');
+      try {
+        const tcp = await fetchClipMetadataTcp(config.ftp.host, entries);
+        metadata = tcp.metadata;
+        slotStats = tcp.slotStats;
+        log(`TCP fallback returned ${metadata.size} clips, ${slotStats.size} slot stats`);
+      } catch (err) {
+        log(`TCP fallback failed: ${(err as Error).message}`);
+      }
+    }
+
+    for (const entry of entries) {
+      const nameNoExt = entry.name.replace(/\.[^.]+$/, '');
+      const meta = metadata.get(entry.name) ?? metadata.get(nameNoExt);
+      if (meta) {
+        entry.codec = meta.codec;
+        entry.videoFormat = meta.videoFormat;
+        entry.startTimecode = meta.startTimecode;
+        entry.duration = meta.duration;
+      }
+    }
+
+    const result = await interactiveSelect(entries, slotStats);
 
     if (result.action === 'quit') {
       return;
@@ -225,7 +455,7 @@ async function runBrowse(ftpHost?: string): Promise<void> {
 
     console.log(`\nQueuing ${result.selected.length} file(s) for transfer...`);
     await executeTransferQueue(result.selected, config);
-    return;
+    continue;
   }
 }
 
@@ -246,16 +476,32 @@ program
   .argument('[outputKey]', 'Output key/filename (default: filename from FTP path)')
   .action(async (ftpPath: string, outputKey?: string) => {
     const config = loadConfig();
-    const manager = new TransferManager(config);
-    const cleanup = setupInteractiveControls(manager);
+    let resumeId: string | undefined;
 
-    try {
-      await manager.transfer(ftpPath, outputKey);
-    } catch (err) {
-      console.error('Transfer failed:', (err as Error).message);
-      process.exit(1);
-    } finally {
-      cleanup();
+    while (true) {
+      const manager = new TransferManager(config);
+      const cleanup = setupInteractiveControls(manager);
+
+      try {
+        const state = resumeId
+          ? await manager.resume(resumeId)
+          : await manager.transfer(ftpPath, outputKey);
+
+        if (state.status !== 'completed') {
+          cleanup();
+          const action = await waitForResumeOrQuit();
+          if (action === 'resume') {
+            resumeId = state.transferId;
+            continue;
+          }
+        }
+        return;
+      } catch (err) {
+        console.error('Transfer failed:', (err as Error).message);
+        process.exit(1);
+      } finally {
+        cleanup();
+      }
     }
   });
 
@@ -277,7 +523,9 @@ program
 
     try {
       await hdClient.connect();
-      const clips = await hdClient.getClips(parseInt(opts.slot, 10));
+      const slotId = parseInt(opts.slot, 10);
+      const deviceInfo = await hdClient.getDeviceInfo();
+      const clips = await hdClient.getClips(slotId);
       await hdClient.close();
 
       if (clips.length === 0) {
@@ -285,10 +533,14 @@ program
         return;
       }
 
-      console.log(`Found ${clips.length} clips to transfer`);
+      // Get volume name for the slot to build correct FTP path (/ssd1/file.mxf)
+      const slotInfo = deviceInfo.slots.find(s => s.slotId === slotId);
+      const volumeName = slotInfo?.volumeName || `slot${slotId}`;
+
+      console.log(`Found ${clips.length} clips to transfer from ${volumeName}`);
 
       for (const clip of clips) {
-        const ftpPath = `/${clip.name}`;
+        const ftpPath = `/${volumeName}/${clip.name}`;
         console.log(`\nTransferring: ${clip.name}`);
         try {
           await manager.transfer(ftpPath);
@@ -310,16 +562,30 @@ program
   .argument('[transferId]', 'Transfer ID to resume (auto-selects if only one)')
   .action(async (transferId?: string) => {
     const config = loadConfig();
-    const manager = new TransferManager(config);
-    const cleanup = setupInteractiveControls(manager);
+    let resumeId = transferId;
 
-    try {
-      await manager.resume(transferId);
-    } catch (err) {
-      console.error('Resume failed:', (err as Error).message);
-      process.exit(1);
-    } finally {
-      cleanup();
+    while (true) {
+      const manager = new TransferManager(config);
+      const cleanup = setupInteractiveControls(manager);
+
+      try {
+        const state = await manager.resume(resumeId);
+
+        if (state.status !== 'completed') {
+          cleanup();
+          const action = await waitForResumeOrQuit();
+          if (action === 'resume') {
+            resumeId = state.transferId;
+            continue;
+          }
+        }
+        return;
+      } catch (err) {
+        console.error('Resume failed:', (err as Error).message);
+        process.exit(1);
+      } finally {
+        cleanup();
+      }
     }
   });
 
@@ -445,6 +711,37 @@ program
     await runBrowse();
   });
 
+function waitForResumeOrQuit(): Promise<'resume' | 'quit'> {
+  return new Promise((resolve) => {
+    if (!process.stdin.isTTY) {
+      resolve('quit');
+      return;
+    }
+
+    console.log('\nPress r to resume, q to quit.');
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const onData = (data: Buffer) => {
+      const key = data.toString();
+      if (key === 'r' || key === 'R') {
+        process.stdin.removeListener('data', onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        resolve('resume');
+      } else if (key === 'q' || key === 'Q' || key === '\x03') {
+        process.stdin.removeListener('data', onData);
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        resolve('quit');
+      }
+    };
+
+    process.stdin.on('data', onData);
+  });
+}
+
 export function setupInteractiveControls(manager: TransferManager): () => void {
   let ctrlCPressed = false;
   let ctrlCTimer: ReturnType<typeof setTimeout> | null = null;
@@ -507,4 +804,21 @@ export function setupInteractiveControls(manager: TransferManager): () => void {
   };
 }
 
+function printSplash(): void {
+  console.log(`
+    .--.        .--.
+ .-(    ).   .-(    ).
+(___.__)__) (___.__)__)
+ ' ' ' ' '   ' ' ' ' '
+    \u26A1   \u26A1   \u26A1
+ ' ' ' ' '   ' ' ' ' '
+
+   P R O C E L L A
+       M E D I A
+
+   record2s3 v1.0.0
+`);
+}
+
+printSplash();
 program.parseAsync();

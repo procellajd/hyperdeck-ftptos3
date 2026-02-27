@@ -12,6 +12,10 @@ export interface BrowseEntry {
   uploadStatus: 'completed' | 'in_progress' | 'not_uploaded';
   transferId?: string;
   transferPercent?: number;
+  codec?: string;           // "ProRes:HQ"
+  videoFormat?: string;     // "1080p25"
+  startTimecode?: string;   // "01:00:00:00"
+  duration?: string;        // "00:05:03:22"
 }
 
 export async function discoverFiles(

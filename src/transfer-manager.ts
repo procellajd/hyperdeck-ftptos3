@@ -1,4 +1,4 @@
-import { Readable, Transform } from 'node:stream';
+import { Transform } from 'node:stream';
 import type { TransformCallback } from 'node:stream';
 import { FtpClient } from './ftp-client.js';
 import { S3MultipartUploader } from './s3-multipart-uploader.js';
@@ -6,8 +6,11 @@ import { FileSystemUploader } from './fs-uploader.js';
 import { ChunkerTransform } from './chunker-transform.js';
 import { StateManager } from './state-manager.js';
 import { ProgressReporter } from './progress-reporter.js';
+import { log } from './logger.js';
 import type { Uploader } from './uploader.js';
 import type { AppConfig, TransferState } from './types.js';
+
+const MAX_S3_PARTS = 10_000;
 
 export type UploaderFactory = () => Uploader;
 
@@ -30,24 +33,38 @@ export class TransferManager {
    * Transfer a file from FTP to the configured destination.
    */
   async transfer(ftpPath: string, outputKey?: string): Promise<TransferState> {
+    log(`transfer() called: ftpPath=${ftpPath}, outputKey=${outputKey}`);
     const key = this.resolveOutputKey(ftpPath, outputKey);
     const ftpClient = new FtpClient(this.config.ftp);
     const uploader = this.createUploader();
 
     try {
       console.log(`Connecting to FTP ${this.config.ftp.host}...`);
+      log(`Connecting to FTP ${this.config.ftp.host}:${this.config.ftp.port}`);
       await ftpClient.connect();
+      log('FTP connected');
 
       console.log(`Getting file size for ${ftpPath}...`);
       const totalFileSize = await ftpClient.getFileSize(ftpPath);
       console.log(`File size: ${formatBytes(totalFileSize)}`);
+      log(`File size: ${totalFileSize} bytes`);
 
       const partSize = this.getPartSize();
       const totalParts = Math.ceil(totalFileSize / partSize);
       const bucket = this.getBucket();
 
+      if (this.config.destination === 's3' && totalParts > MAX_S3_PARTS) {
+        const minPartSize = Math.ceil(totalFileSize / MAX_S3_PARTS);
+        throw new Error(
+          `File requires ${totalParts} parts but S3 allows a maximum of ${MAX_S3_PARTS}. ` +
+          `Increase HDFS_S3_PART_SIZE to at least ${minPartSize} (${formatBytes(minPartSize)}).`,
+        );
+      }
+
       console.log(`Initiating multipart upload to ${this.destinationLabel(key)}...`);
+      log(`Creating multipart upload: bucket=${bucket}, key=${key}`);
       const uploadId = await uploader.createMultipartUpload(bucket, key);
+      log(`Multipart upload created: uploadId=${uploadId}`);
 
       const state = this.stateManager.createState({
         uploadId,
@@ -60,6 +77,7 @@ export class TransferManager {
       });
 
       console.log(`Transfer ${state.transferId} started (${totalParts} parts)`);
+      log(`Transfer ${state.transferId} started (${totalParts} parts, partSize=${partSize})`);
 
       this.progress.start({
         transferId: state.transferId,
@@ -67,7 +85,7 @@ export class TransferManager {
         totalParts,
       });
 
-      await this.executePipeline(ftpClient, uploader, state, 0);
+      await this.executeWithRetry(ftpClient, uploader, state, 0);
 
       this.progress.report();
       this.progress.stop();
@@ -75,16 +93,19 @@ export class TransferManager {
       if (this.aborted) {
         if (this.abortMode === 'cancel') {
           console.log(`\nAborting upload and cleaning up parts...`);
+          log(`Transfer ${state.transferId} cancelled, cleaning up`);
           await uploader.abortMultipartUpload(state.bucket, state.key, state.uploadId);
           this.stateManager.markAborted(state);
           console.log(`Transfer ${state.transferId} aborted. Uploaded parts deleted.`);
         } else {
+          log(`Transfer ${state.transferId} paused at ${state.totalBytesTransferred} bytes`);
           console.log(`\nTransfer ${state.transferId} paused. Resume with: hdfs resume ${state.transferId}`);
         }
         return state;
       }
 
       console.log(`Completing upload...`);
+      log(`Completing multipart upload ${state.transferId}`);
       const location = await uploader.completeMultipartUpload(
         state.bucket,
         state.key,
@@ -93,9 +114,14 @@ export class TransferManager {
       );
       this.stateManager.markCompleted(state);
       console.log(`Transfer complete: ${location}`);
+      log(`Transfer ${state.transferId} complete: ${location}`);
 
       return state;
+    } catch (err) {
+      log(`transfer() error: ${(err as Error).message}\n${(err as Error).stack}`);
+      throw err;
     } finally {
+      log('transfer() finally: cleaning up');
       this.progress.stop();
       ftpClient.close();
       uploader.destroy();
@@ -147,6 +173,14 @@ export class TransferManager {
       const totalParts = Math.ceil(state.totalFileSize / state.partSize);
       const completedParts = state.completedParts.length;
 
+      if ((state.destination ?? 's3') === 's3' && totalParts > MAX_S3_PARTS) {
+        const minPartSize = Math.ceil(state.totalFileSize / MAX_S3_PARTS);
+        throw new Error(
+          `File requires ${totalParts} parts but S3 allows a maximum of ${MAX_S3_PARTS}. ` +
+          `Increase HDFS_S3_PART_SIZE to at least ${minPartSize} (${formatBytes(minPartSize)}).`,
+        );
+      }
+
       console.log(
         `Resuming transfer ${state.transferId}: ${completedParts}/${totalParts} parts complete, offset ${formatBytes(startOffset)}`,
       );
@@ -162,7 +196,7 @@ export class TransferManager {
         partsAlreadyCompleted: completedParts,
       });
 
-      await this.executePipeline(ftpClient, uploader, state, startOffset);
+      await this.executeWithRetry(ftpClient, uploader, state, startOffset);
 
       this.progress.report();
       this.progress.stop();
@@ -231,6 +265,43 @@ export class TransferManager {
   }
 
   /**
+   * Retry wrapper around executePipeline. On transient FTP errors, reconnects
+   * and restarts the pipeline from the last saved offset.
+   */
+  private async executeWithRetry(
+    ftpClient: FtpClient,
+    uploader: Uploader,
+    state: TransferState,
+    startOffset: number,
+  ): Promise<void> {
+    const maxRetries = this.config.ftp.maxRetries;
+    log(`executeWithRetry: startOffset=${startOffset}, maxRetries=${maxRetries}`);
+
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const offset = attempt === 0 ? startOffset : state.totalBytesTransferred;
+        log(`executeWithRetry: attempt ${attempt}, offset=${offset}`);
+        await this.executePipeline(ftpClient, uploader, state, offset);
+        log('executeWithRetry: pipeline completed successfully');
+        return;
+      } catch (err) {
+        const isTransient = isFtpTransientError(err);
+        log(`executeWithRetry: pipeline threw: ${(err as Error).message} (transient=${isTransient}, aborted=${this.aborted}, attempt=${attempt}/${maxRetries})`);
+        if (this.aborted) throw err;
+        if (attempt >= maxRetries || !isTransient) throw err;
+
+        console.log(
+          `\nFTP stream error (attempt ${attempt + 1}/${maxRetries}): ${(err as Error).message}`,
+        );
+        console.log(`Reconnecting and resuming from ${formatBytes(state.totalBytesTransferred)}...`);
+        log('executeWithRetry: calling ftpClient.reconnect()');
+        await ftpClient.reconnect();
+        log('executeWithRetry: reconnected successfully');
+      }
+    }
+  }
+
+  /**
    * Execute the streaming pipeline: FTP -> ChunkerTransform -> uploader.
    */
   private async executePipeline(
@@ -239,11 +310,13 @@ export class TransferManager {
     state: TransferState,
     startOffset: number,
   ): Promise<void> {
+    log(`executePipeline: starting download from offset ${startOffset}`);
     const ftpStream = await ftpClient.downloadToStream(
       state.ftpPath,
       startOffset,
       this.config.highWaterMark,
     );
+    log('executePipeline: FTP stream created');
 
     // Count bytes as they arrive from FTP for download speed reporting
     let downloadedBytes = startOffset;
@@ -256,7 +329,6 @@ export class TransferManager {
     this.progress.setDownloadCounter(() => downloadedBytes);
 
     const chunker = new ChunkerTransform(state.partSize);
-    const pipeline = ftpStream.pipe(counter).pipe(chunker);
 
     let nextPartNumber = state.completedParts.length + 1;
 
@@ -264,11 +336,26 @@ export class TransferManager {
     const inFlight = new Set<Promise<void>>();
     let pipelineError: Error | null = null;
 
+    // Attach error listeners BEFORE piping so errors are captured
+    // instead of becoming uncaught exceptions that silently kill the process.
+    const captureError = (err: Error) => {
+      if (!pipelineError) {
+        log(`executePipeline: stream error captured: ${err.message}`);
+        pipelineError = err;
+        // Destroy the chunker to unblock the for-await consumer
+        if (!chunker.destroyed) chunker.destroy();
+      }
+    };
+    ftpStream.on('error', captureError);
+    counter.on('error', captureError);
+    chunker.on('error', captureError);
+
+    ftpStream.pipe(counter).pipe(chunker);
+
     // Use for-await-of for backpressure: reads chunks as slots open up.
-    // Wrap in try/catch so FTP stream errors don't orphan in-flight uploads.
-    const readable = Readable.from(pipeline);
+    // Iterate chunker directly (Transform streams are AsyncIterable in Node.js 16+).
     try {
-      for await (const chunk of readable) {
+      for await (const chunk of chunker) {
         if (this.aborted || pipelineError) break;
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
@@ -300,16 +387,20 @@ export class TransferManager {
     } catch (err) {
       // FTP stream error (e.g. data socket timeout) — capture it but
       // still drain in-flight uploads so completed parts are saved.
+      log(`executePipeline: for-await threw: ${(err as Error).message}`);
       pipelineError = pipelineError ?? (err as Error);
     }
 
+    log(`executePipeline: draining ${inFlight.size} in-flight uploads`);
     // Drain remaining in-flight uploads
     await Promise.all(inFlight);
 
     if (pipelineError) {
+      log(`executePipeline: saving state and throwing: ${pipelineError.message}`);
       this.stateManager.saveState(state);
       throw pipelineError;
     }
+    log(`executePipeline: finished, ${state.completedParts.length} parts, ${state.totalBytesTransferred} bytes`);
   }
 
   private defaultUploader(): Uploader {
@@ -376,4 +467,28 @@ function formatBytes(bytes: number): string {
   const i = Math.floor(Math.log(bytes) / Math.log(1024));
   const value = bytes / Math.pow(1024, i);
   return `${value.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+
+const TRANSIENT_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ETIMEDOUT',
+  'EPIPE',
+  'ENETUNREACH',
+  'EHOSTUNREACH',
+  'ECONNREFUSED',
+]);
+
+const TRANSIENT_MESSAGE_PATTERNS = [
+  'timeout',
+  'timed out',
+  'data socket',
+  'connection closed',
+];
+
+function isFtpTransientError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const code = (err as NodeJS.ErrnoException).code;
+  if (code && TRANSIENT_ERROR_CODES.has(code)) return true;
+  const msg = err.message.toLowerCase();
+  return TRANSIENT_MESSAGE_PATTERNS.some(pattern => msg.includes(pattern));
 }

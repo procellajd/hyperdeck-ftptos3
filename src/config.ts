@@ -52,6 +52,7 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
       password: env('HDFS_FTP_PASSWORD', ''),
       timeout: envInt('HDFS_FTP_TIMEOUT', 120000),
       keepalive: envInt('HDFS_FTP_KEEPALIVE', 10000),
+      maxRetries: envInt('HDFS_FTP_MAX_RETRIES', 5),
     },
     s3: {
       bucket: env('HDFS_S3_BUCKET', ''),

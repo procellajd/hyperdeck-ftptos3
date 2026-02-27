@@ -139,10 +139,12 @@ export class ProgressReporter {
       process.stdout.write(`\x1b[${this.linesWritten}A`);
     }
 
-    // Write stats + controls, clearing each line
+    // Write stats + controls, clearing each line.
+    // Since there is no trailing \n, the cursor sits on the last visual line,
+    // so we only need to move up (totalLines - 1) to reach the first line.
     const totalLines = visualLines(stats) + visualLines(controls);
     process.stdout.write(`\r\x1b[J${stats}\n\x1b[2m${controls}\x1b[0m`);
-    this.linesWritten = totalLines;
+    this.linesWritten = totalLines - 1;
   }
 }
 
