@@ -1,5 +1,6 @@
 import { Transform } from 'node:stream';
 import type { TransformCallback } from 'node:stream';
+import { crc32 } from 'node:zlib';
 import { FtpClient } from './ftp-client.js';
 import { S3MultipartUploader } from './s3-multipart-uploader.js';
 import { FileSystemUploader } from './fs-uploader.js';
@@ -49,19 +50,18 @@ export class TransferManager {
       console.log(`File size: ${formatBytes(totalFileSize)}`);
       log(`File size: ${totalFileSize} bytes`);
 
-      const partSize = this.getPartSize();
+      const basePartSize = this.getPartSize();
+      const partSize = autoScalePartSize(basePartSize, totalFileSize);
+      if (partSize !== basePartSize) {
+        console.log(`Auto-scaled part size: ${formatBytes(basePartSize)} → ${formatBytes(partSize)} (file needs ${Math.ceil(totalFileSize / basePartSize)} parts at default, max ${MAX_S3_PARTS})`);
+        log(`Auto-scaled part size from ${basePartSize} to ${partSize}`);
+      }
       const totalParts = Math.ceil(totalFileSize / partSize);
       const bucket = this.getBucket();
 
-      if (this.config.destination === 's3' && totalParts > MAX_S3_PARTS) {
-        const minPartSize = Math.ceil(totalFileSize / MAX_S3_PARTS);
-        throw new Error(
-          `File requires ${totalParts} parts but S3 allows a maximum of ${MAX_S3_PARTS}. ` +
-          `Increase HDFS_S3_PART_SIZE to at least ${minPartSize} (${formatBytes(minPartSize)}).`,
-        );
-      }
-
-      console.log(`Initiating multipart upload to ${this.destinationLabel(key)}...`);
+      const useChecksum = this.config.destination === 's3' && this.config.s3.checksumAlgorithm === 'CRC32';
+      const checksumSuffix = useChecksum ? ' (CRC32 integrity check enabled)' : '';
+      console.log(`Initiating multipart upload to ${this.destinationLabel(key)}...${checksumSuffix}`);
       log(`Creating multipart upload: bucket=${bucket}, key=${key}`);
       const uploadId = await uploader.createMultipartUpload(bucket, key);
       log(`Multipart upload created: uploadId=${uploadId}`);
@@ -79,6 +79,7 @@ export class TransferManager {
       console.log(`Transfer ${state.transferId} started (${totalParts} parts)`);
       log(`Transfer ${state.transferId} started (${totalParts} parts, partSize=${partSize})`);
 
+      this.progress.checksumEnabled = useChecksum;
       this.progress.start({
         transferId: state.transferId,
         totalBytes: totalFileSize,
@@ -170,16 +171,16 @@ export class TransferManager {
       this.stateManager.saveState(state);
 
       const startOffset = state.totalBytesTransferred;
+      // Auto-scale part size for resumed transfers (applies to remaining parts)
+      const scaledPartSize = autoScalePartSize(state.partSize, state.totalFileSize);
+      if (scaledPartSize !== state.partSize) {
+        console.log(`Auto-scaled part size: ${formatBytes(state.partSize)} → ${formatBytes(scaledPartSize)}`);
+        log(`Auto-scaled part size from ${state.partSize} to ${scaledPartSize}`);
+        state.partSize = scaledPartSize;
+        this.stateManager.saveState(state);
+      }
       const totalParts = Math.ceil(state.totalFileSize / state.partSize);
       const completedParts = state.completedParts.length;
-
-      if ((state.destination ?? 's3') === 's3' && totalParts > MAX_S3_PARTS) {
-        const minPartSize = Math.ceil(state.totalFileSize / MAX_S3_PARTS);
-        throw new Error(
-          `File requires ${totalParts} parts but S3 allows a maximum of ${MAX_S3_PARTS}. ` +
-          `Increase HDFS_S3_PART_SIZE to at least ${minPartSize} (${formatBytes(minPartSize)}).`,
-        );
-      }
 
       console.log(
         `Resuming transfer ${state.transferId}: ${completedParts}/${totalParts} parts complete, offset ${formatBytes(startOffset)}`,
@@ -188,6 +189,7 @@ export class TransferManager {
       console.log(`Connecting to FTP ${this.config.ftp.host}...`);
       await ftpClient.connect();
 
+      this.progress.checksumEnabled = this.config.destination === 's3' && this.config.s3.checksumAlgorithm === 'CRC32';
       this.progress.start({
         transferId: state.transferId,
         totalBytes: state.totalFileSize,
@@ -331,6 +333,7 @@ export class TransferManager {
     const chunker = new ChunkerTransform(state.partSize);
 
     let nextPartNumber = state.completedParts.length + 1;
+    const useChecksum = this.config.destination === 's3' && this.config.s3.checksumAlgorithm === 'CRC32';
 
     const concurrency = this.getConcurrency();
     const inFlight = new Set<Promise<void>>();
@@ -360,6 +363,12 @@ export class TransferManager {
 
         const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
         const partNumber = nextPartNumber++;
+        let checksum: string | undefined;
+        if (useChecksum) {
+          const crcBuf = Buffer.alloc(4);
+          crcBuf.writeUInt32BE(crc32(buffer), 0);
+          checksum = crcBuf.toString('base64');
+        }
 
         const task = (async () => {
           const completedPart = await uploader.uploadPart(
@@ -368,6 +377,7 @@ export class TransferManager {
             state.uploadId,
             partNumber,
             buffer,
+            checksum,
           );
 
           this.stateManager.recordPart(state, completedPart);
@@ -395,9 +405,12 @@ export class TransferManager {
     // Drain remaining in-flight uploads
     await Promise.all(inFlight);
 
+    // Always flush state after drain — ensures the final batch of parts is persisted
+    // regardless of how the pipeline exits (success, error, abort, pause).
+    this.stateManager.flush(state);
+
     if (pipelineError) {
-      log(`executePipeline: saving state and throwing: ${pipelineError.message}`);
-      this.stateManager.saveState(state);
+      log(`executePipeline: throwing after flush: ${pipelineError.message}`);
       throw pipelineError;
     }
     log(`executePipeline: finished, ${state.completedParts.length} parts, ${state.totalBytesTransferred} bytes`);
@@ -484,6 +497,21 @@ const TRANSIENT_MESSAGE_PATTERNS = [
   'data socket',
   'connection closed',
 ];
+
+const MAX_S3_PART_SIZE = 5 * 1024 * 1024 * 1024; // 5 GB
+
+function autoScalePartSize(basePartSize: number, totalFileSize: number): number {
+  const neededParts = Math.ceil(totalFileSize / basePartSize);
+  if (neededParts <= MAX_S3_PARTS) return basePartSize;
+  const scaled = Math.ceil(totalFileSize / MAX_S3_PARTS);
+  if (scaled > MAX_S3_PART_SIZE) {
+    throw new Error(
+      `File size ${formatBytes(totalFileSize)} is too large: even at maximum part size (5 GB), ` +
+      `it would require ${Math.ceil(totalFileSize / MAX_S3_PART_SIZE)} parts (max ${MAX_S3_PARTS}).`,
+    );
+  }
+  return scaled;
+}
 
 function isFtpTransientError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;

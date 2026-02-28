@@ -24,6 +24,7 @@ export async function discoverFiles(
   s3Config?: S3Config,
   fsConfig?: FileSystemConfig,
   destination?: DestinationType,
+  skipDestinationCheck?: boolean,
 ): Promise<BrowseEntry[]> {
   // 1. List root to find slot directories
   const rootItems = await ftpClient.list('/');
@@ -35,6 +36,7 @@ export async function discoverFiles(
     const files = await ftpClient.list('/' + slot.name);
     for (const file of files) {
       if (file.type !== 1) continue;
+      if (file.name.startsWith('._')) continue;  // macOS resource fork
       entries.push({
         ftpPath: `/${slot.name}/${file.name}`,
         name: file.name,
@@ -82,7 +84,7 @@ export async function discoverFiles(
 
   // 4. Destination fallback — check unmatched files against destination
   const unchecked = entries.filter(e => e.uploadStatus === 'not_uploaded');
-  if (unchecked.length > 0) {
+  if (unchecked.length > 0 && !skipDestinationCheck) {
     const dest = destination ?? 's3';
 
     if (dest === 'local' && fsConfig) {

@@ -43,6 +43,7 @@ export class FileSystemUploader implements Uploader {
     uploadId: string,
     partNumber: number,
     body: Buffer,
+    _checksum?: string,
   ): Promise<CompletedPart> {
     const partsDir = this.partsDir(key, uploadId);
     const partFile = join(partsDir, this.partFilename(partNumber));

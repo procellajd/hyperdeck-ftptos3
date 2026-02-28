@@ -5,6 +5,8 @@ import type { TransferState, CompletedPart, DestinationType } from './types.js';
 
 export class StateManager {
   private readonly stateDir: string;
+  private saveCounter = 0;
+  private static readonly SAVE_EVERY = 10;
 
   constructor(stateDir: string) {
     this.stateDir = stateDir;
@@ -50,7 +52,18 @@ export class StateManager {
     state.completedParts.push(part);
     state.totalBytesTransferred += part.size;
     state.updatedAt = new Date().toISOString();
+    if (++this.saveCounter >= StateManager.SAVE_EVERY) {
+      this.saveState(state);
+      this.saveCounter = 0;
+    }
+  }
+
+  /**
+   * Unconditionally save state to disk. Call at end-of-transfer, on error, and on pause.
+   */
+  flush(state: TransferState): void {
     this.saveState(state);
+    this.saveCounter = 0;
   }
 
   /**
@@ -77,7 +90,7 @@ export class StateManager {
   saveState(state: TransferState): void {
     const filePath = this.statePath(state.transferId);
     const tempPath = filePath + '.tmp.' + Date.now();
-    writeFileSync(tempPath, JSON.stringify(state, null, 2), 'utf-8');
+    writeFileSync(tempPath, JSON.stringify(state), 'utf-8');
     renameSync(tempPath, filePath);
   }
 

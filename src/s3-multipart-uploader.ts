@@ -7,6 +7,9 @@ import {
   ListPartsCommand,
   HeadObjectCommand,
 } from '@aws-sdk/client-s3';
+import { NodeHttpHandler } from '@smithy/node-http-handler';
+import { Agent as HttpAgent } from 'node:http';
+import { Agent as HttpsAgent } from 'node:https';
 import type { S3Config, CompletedPart } from './types.js';
 import type { Uploader } from './uploader.js';
 
@@ -30,6 +33,12 @@ export class S3MultipartUploader implements Uploader {
             },
           }
         : {}),
+      requestHandler: new NodeHttpHandler({
+        connectionTimeout: 5000,
+        socketTimeout: 90000,
+        httpAgent: new HttpAgent({ keepAlive: true, maxSockets: 64 }),
+        httpsAgent: new HttpsAgent({ keepAlive: true, maxSockets: 64 }),
+      }),
     });
   }
 
@@ -41,6 +50,7 @@ export class S3MultipartUploader implements Uploader {
       new CreateMultipartUploadCommand({
         Bucket: bucket,
         Key: key,
+        ...(this.config.checksumAlgorithm ? { ChecksumAlgorithm: this.config.checksumAlgorithm } : {}),
       }),
     );
     if (!response.UploadId) {
@@ -59,6 +69,7 @@ export class S3MultipartUploader implements Uploader {
     uploadId: string,
     partNumber: number,
     body: Buffer,
+    checksum?: string,
   ): Promise<CompletedPart> {
     let lastError: Error | undefined;
 
@@ -71,6 +82,7 @@ export class S3MultipartUploader implements Uploader {
             UploadId: uploadId,
             PartNumber: partNumber,
             Body: body,
+            ...(checksum ? { ChecksumCRC32: checksum } : {}),
           }),
         );
 
@@ -82,6 +94,7 @@ export class S3MultipartUploader implements Uploader {
           partNumber,
           etag: response.ETag,
           size: body.length,
+          ...(checksum ? { checksum } : {}),
         };
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
@@ -121,6 +134,7 @@ export class S3MultipartUploader implements Uploader {
           Parts: sorted.map(p => ({
             PartNumber: p.partNumber,
             ETag: p.etag,
+            ...(p.checksum ? { ChecksumCRC32: p.checksum } : {}),
           })),
         },
       }),

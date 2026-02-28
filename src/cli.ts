@@ -13,14 +13,38 @@ import { interactiveSelect } from './interactive-select.js';
 import { executeTransferQueue } from './transfer-queue.js';
 import { log, logToFile } from './logger.js';
 import type { BrowseEntry } from './file-browser.js';
+import { S3Client, HeadBucketCommand } from '@aws-sdk/client-s3';
 import type { DestinationType } from './types.js';
+
+/**
+ * Wait for user to press any key, then exit.
+ * Prevents the console window from closing before the user can read error messages
+ * (common issue when running as a Windows .exe).
+ */
+function fatalExit(code = 1): never {
+  if (process.stdin.isTTY) {
+    console.error('\nPress any key to exit...');
+    try {
+      process.stdin.setRawMode(true);
+      process.stdin.resume();
+      process.stdin.once('data', () => process.exit(code));
+    } catch {
+      process.exit(code);
+    }
+  } else {
+    process.exit(code);
+  }
+  // Keep the process alive until the keypress handler fires
+  // (the 'never' return type is satisfied by process.exit above for non-TTY)
+  return undefined as never;
+}
 
 // Safety net: catch any truly unhandled errors so the process never silently exits
 process.on('uncaughtException', (err) => {
   logToFile('FATAL', `Uncaught exception: ${err.message}`, err.stack);
   console.error(`[FATAL] Uncaught exception: ${err.message}`);
   if (err.stack) console.error(err.stack);
-  process.exit(1);
+  fatalExit(1);
 });
 
 process.on('unhandledRejection', (reason) => {
@@ -29,7 +53,7 @@ process.on('unhandledRejection', (reason) => {
   logToFile('FATAL', `Unhandled rejection: ${msg}`, stack);
   console.error(`[FATAL] Unhandled rejection: ${msg}`);
   if (stack) console.error(stack);
-  process.exit(1);
+  fatalExit(1);
 });
 
 process.on('exit', (code) => {
@@ -283,7 +307,8 @@ async function fetchClipMetadataTcp(
     await client.connect();
     const deviceInfo = await client.getDeviceInfo();
 
-    // Build a map from volume name → slot id
+    // FTP directories are named "ssd1", "ssd2", etc. — extract slot ID directly.
+    // Also build volume-name map as fallback for non-ssd naming.
     const volumeToSlotId = new Map<string, number>();
     for (const slot of deviceInfo.slots) {
       if (slot.volumeName) {
@@ -299,9 +324,11 @@ async function fetchClipMetadataTcp(
     }
 
     for (const [slotName, clipNames] of slotGroups) {
-      const slotId = volumeToSlotId.get(slotName);
+      // "ssd1" → 1, "ssd2" → 2, etc.
+      const ssdMatch = slotName.match(/^ssd(\d+)$/i);
+      const slotId = ssdMatch ? parseInt(ssdMatch[1], 10) : volumeToSlotId.get(slotName);
       if (slotId === undefined) {
-        log(`fetchClipMetadataTcp: no slot id for volume "${slotName}"`);
+        log(`fetchClipMetadataTcp: no slot id for "${slotName}"`);
         continue;
       }
 
@@ -346,7 +373,7 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     const host = await promptWithDefault('HyperDeck IP address', 'HDFS_FTP_HOST');
     if (!host) {
       console.error('No IP address provided');
-      process.exit(1);
+      fatalExit(1);
     }
   }
 
@@ -364,7 +391,7 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     const bucket = await promptWithDefault('S3/R2 Bucket', 'HDFS_S3_BUCKET');
     if (!bucket) {
       console.error('No bucket provided');
-      process.exit(1);
+      fatalExit(1);
     }
     await promptWithDefault('S3/R2 Endpoint', 'HDFS_S3_ENDPOINT');
     await promptWithDefault('S3/R2 Access Key ID', 'HDFS_S3_ACCESS_KEY_ID');
@@ -374,16 +401,47 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     const outputDir = await promptWithDefault('Output directory', 'HDFS_FS_OUTPUT_DIR');
     if (!outputDir) {
       console.error('No output directory provided');
-      process.exit(1);
+      fatalExit(1);
     }
   }
 
   saveEnvChanges();
   console.log('');
 
-  const config = loadConfig();
+  let config;
+  try {
+    config = loadConfig();
+  } catch (err) {
+    console.error(`Configuration error: ${(err as Error).message}`);
+    fatalExit(1);
+  }
+
+  // Verify S3/R2 credentials before entering browse
+  if (config.destination === 's3') {
+    console.log(`Verifying access to s3://${config.s3.bucket}...`);
+    let s3: S3Client | undefined;
+    try {
+      s3 = new S3Client({
+        region: config.s3.region,
+        ...(config.s3.endpoint ? { endpoint: config.s3.endpoint } : {}),
+        forcePathStyle: config.s3.forcePathStyle,
+        ...(config.s3.accessKeyId && config.s3.secretAccessKey
+          ? { credentials: { accessKeyId: config.s3.accessKeyId, secretAccessKey: config.s3.secretAccessKey } }
+          : {}),
+      });
+      await s3.send(new HeadBucketCommand({ Bucket: config.s3.bucket }));
+      s3.destroy();
+      console.log('S3 credentials verified.\n');
+    } catch (err) {
+      s3?.destroy();
+      console.error(`\nS3 credential check failed: ${(err as Error).message}`);
+      console.error('Check your bucket name, endpoint, and access keys.');
+      fatalExit(1);
+    }
+  }
 
   let entries;
+  let skipDestinationCheck = false;
   while (true) {
     const ftpClient = new FtpClient(config.ftp);
     const stateManager = new StateManager(config.stateDir);
@@ -391,11 +449,12 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     try {
       console.log(`Connecting to FTP ${config.ftp.host}...`);
       await ftpClient.connect();
-      entries = await discoverFiles(ftpClient, stateManager, config.s3, config.fs, config.destination);
+      entries = await discoverFiles(ftpClient, stateManager, config.s3, config.fs, config.destination, skipDestinationCheck);
+      skipDestinationCheck = false;
       ftpClient.close();
     } catch (err) {
       console.error('Failed to list files:', (err as Error).message);
-      process.exit(1);
+      fatalExit(1);
     }
 
     if (entries.length === 0) {
@@ -437,7 +496,16 @@ async function runBrowse(ftpHost?: string): Promise<void> {
       }
     }
 
-    const result = await interactiveSelect(entries, slotStats);
+    log(`Entering interactiveSelect with ${entries.length} entries, stdin.isTTY=${process.stdin.isTTY}`);
+    let result;
+    try {
+      result = await interactiveSelect(entries, slotStats);
+    } catch (err) {
+      logToFile('ERROR', `interactiveSelect threw: ${(err as Error).message}`, (err as Error).stack);
+      console.error(`Browse UI error: ${(err as Error).message}`);
+      fatalExit(1);
+    }
+    log(`interactiveSelect returned action=${result.action}, selected=${result.selected.length}`);
 
     if (result.action === 'quit') {
       return;
@@ -445,6 +513,20 @@ async function runBrowse(ftpHost?: string): Promise<void> {
 
     if (result.action === 'refresh') {
       continue;
+    }
+
+    if (result.action === 'clear') {
+      const stateManager = new StateManager(config.stateDir);
+      let cleared = 0;
+      for (const entry of entries) {
+        if (entry.uploadStatus && entry.transferId) {
+          stateManager.deleteState(entry.transferId);
+          cleared++;
+        }
+      }
+      console.log(`Cleared ${cleared} upload status record${cleared !== 1 ? 's' : ''}`);
+      skipDestinationCheck = true;
+      continue; // re-discover files
     }
 
     // action === 'confirm'
@@ -498,7 +580,7 @@ program
         return;
       } catch (err) {
         console.error('Transfer failed:', (err as Error).message);
-        process.exit(1);
+        fatalExit(1);
       } finally {
         cleanup();
       }
@@ -514,7 +596,7 @@ program
 
     if (!config.hyperdeckHost) {
       console.error('HDFS_HYPERDECK_HOST is required for clip discovery');
-      process.exit(1);
+      fatalExit(1);
     }
 
     const hdClient = new HyperDeckClient(config.hyperdeckHost);
@@ -550,7 +632,7 @@ program
       }
     } catch (err) {
       console.error('Transfer-all failed:', (err as Error).message);
-      process.exit(1);
+      fatalExit(1);
     } finally {
       cleanup();
     }
@@ -582,7 +664,7 @@ program
         return;
       } catch (err) {
         console.error('Resume failed:', (err as Error).message);
-        process.exit(1);
+        fatalExit(1);
       } finally {
         cleanup();
       }
@@ -628,7 +710,7 @@ program
       await manager.abort(transferId);
     } catch (err) {
       console.error('Abort failed:', (err as Error).message);
-      process.exit(1);
+      fatalExit(1);
     }
   });
 
@@ -641,7 +723,7 @@ program
 
     if (!config.hyperdeckHost) {
       console.error('HDFS_HYPERDECK_HOST is required for clip discovery');
-      process.exit(1);
+      fatalExit(1);
     }
 
     const hdClient = new HyperDeckClient(config.hyperdeckHost);
@@ -665,7 +747,7 @@ program
       }
     } catch (err) {
       console.error('Failed to list clips:', (err as Error).message);
-      process.exit(1);
+      fatalExit(1);
     }
   });
 
@@ -677,7 +759,7 @@ program
 
     if (!config.hyperdeckHost) {
       console.error('HDFS_HYPERDECK_HOST is required');
-      process.exit(1);
+      fatalExit(1);
     }
 
     const hdClient = new HyperDeckClient(config.hyperdeckHost);
@@ -700,7 +782,7 @@ program
       }
     } catch (err) {
       console.error('Failed to get device info:', (err as Error).message);
-      process.exit(1);
+      fatalExit(1);
     }
   });
 
@@ -742,7 +824,7 @@ function waitForResumeOrQuit(): Promise<'resume' | 'quit'> {
   });
 }
 
-export function setupInteractiveControls(manager: TransferManager): () => void {
+export function setupInteractiveControls(manager: TransferManager, keepStdinAlive = false): () => void {
   let ctrlCPressed = false;
   let ctrlCTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -797,8 +879,10 @@ export function setupInteractiveControls(manager: TransferManager): () => void {
     if (ctrlCTimer) clearTimeout(ctrlCTimer);
     if (process.stdin.isTTY) {
       process.stdin.removeListener('data', onData);
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
+      if (!keepStdinAlive) {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+      }
     }
     process.removeListener('SIGTERM', onSigterm);
   };
@@ -821,4 +905,11 @@ function printSplash(): void {
 }
 
 printSplash();
-program.parseAsync();
+program.parseAsync().catch((err: unknown) => {
+  const msg = err instanceof Error ? err.message : String(err);
+  const stack = err instanceof Error ? err.stack : undefined;
+  logToFile('FATAL', `Command failed: ${msg}`, stack);
+  console.error(`[FATAL] ${msg}`);
+  if (stack) console.error(stack);
+  fatalExit(1);
+});

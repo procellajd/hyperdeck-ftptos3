@@ -14,6 +14,7 @@ export class ProgressReporter {
   private lastReportTime: number = 0;
   private linesWritten: number = 0;
   private downloadCounter: (() => number) | null = null;
+  checksumEnabled: boolean = false;
 
   constructor(intervalMs: number) {
     this.intervalMs = intervalMs;
@@ -128,7 +129,8 @@ export class ProgressReporter {
     const avgStr = padLeft(formatMbps(avgSpeed), 10);
 
     const stats = `  ${bar} ${pct.padStart(5)}%  ${transferred}/${total}  DL:${dlStr}  UL:${ulStr}  Avg:${avgStr}  ETA: ${eta}  [${elapsed}]  Parts: ${p.partsCompleted}/${p.totalParts}`;
-    const controls = `  Ctrl+C/q: pause | a: abort | Ctrl+C x2: force quit`;
+    const checksumTag = this.checksumEnabled ? 'CRC32 \u2713 | ' : '';
+    const controls = `  ${checksumTag}Ctrl+C/q: pause | a: abort | Ctrl+C x2: force quit`;
 
     // Calculate how many visual lines each string occupies when wrapped
     const cols = process.stdout.columns || 80;

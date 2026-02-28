@@ -30,6 +30,17 @@ function envOptional(key: string): string | undefined {
   return value;
 }
 
+/**
+ * When region is 'auto', try to extract it from the endpoint URL.
+ * AWS endpoints use the pattern s3.<region>.amazonaws.com.
+ * For non-AWS endpoints (R2 etc.), 'auto' is kept as-is.
+ */
+function resolveRegion(region: string, endpoint?: string): string {
+  if (region !== 'auto' || !endpoint) return region;
+  const match = endpoint.match(/s3[.-]([a-z0-9-]+)\.amazonaws\.com/);
+  return match ? match[1] : region;
+}
+
 export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
   const destination = env('HDFS_DESTINATION', 's3') as DestinationType;
 
@@ -38,7 +49,7 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
   if (destination === 'local' || fsOutputDir) {
     fsConfig = {
       outputDir: fsOutputDir ?? '',
-      partSize: envInt('HDFS_FS_PART_SIZE', 25 * 1024 * 1024),
+      partSize: envInt('HDFS_FS_PART_SIZE', 100 * 1024 * 1024),
       maxRetries: envInt('HDFS_FS_MAX_RETRIES', 3),
       concurrency: envInt('HDFS_FS_CONCURRENCY', 4),
     };
@@ -57,18 +68,19 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
     s3: {
       bucket: env('HDFS_S3_BUCKET', ''),
       keyPrefix: env('HDFS_S3_KEY_PREFIX', ''),
-      region: env('HDFS_S3_REGION', 'us-east-1'),
+      region: resolveRegion(env('HDFS_S3_REGION', 'us-east-1'), envOptional('HDFS_S3_ENDPOINT')),
       endpoint: envOptional('HDFS_S3_ENDPOINT'),
       accessKeyId: envOptional('HDFS_S3_ACCESS_KEY_ID'),
       secretAccessKey: envOptional('HDFS_S3_SECRET_ACCESS_KEY'),
       forcePathStyle: envBool('HDFS_S3_FORCE_PATH_STYLE', false),
       partSize: envInt('HDFS_S3_PART_SIZE', 25 * 1024 * 1024),
       maxRetries: envInt('HDFS_S3_MAX_RETRIES', 3),
-      concurrency: envInt('HDFS_S3_CONCURRENCY', 3),
+      concurrency: envInt('HDFS_S3_CONCURRENCY', 8),
+      checksumAlgorithm: env('HDFS_S3_CHECKSUM', 'CRC32') === 'none' ? undefined : 'CRC32',
     },
     destination,
     fs: fsConfig,
-    highWaterMark: envInt('HDFS_HIGH_WATER_MARK', 1024 * 1024),
+    highWaterMark: envInt('HDFS_HIGH_WATER_MARK', 4 * 1024 * 1024),
     stateDir: env('HDFS_STATE_DIR', './state'),
     progressInterval: envInt('HDFS_PROGRESS_INTERVAL', 5000),
     hyperdeckHost: envOptional('HDFS_HYPERDECK_HOST'),

@@ -19,6 +19,7 @@ export interface S3Config {
   partSize: number;
   maxRetries: number;
   concurrency: number;
+  checksumAlgorithm?: 'CRC32';
 }
 
 export type DestinationType = 's3' | 'local';
@@ -45,6 +46,7 @@ export interface CompletedPart {
   partNumber: number;
   etag: string;
   size: number;
+  checksum?: string;  // Base64-encoded CRC32
 }
 
 export interface TransferState {

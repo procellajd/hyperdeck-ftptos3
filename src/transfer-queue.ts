@@ -36,7 +36,7 @@ export async function executeTransferQueue(
 
     // Fresh TransferManager per file to avoid stale aborted flag
     const manager = new TransferManager(config);
-    const cleanup = setupInteractiveControls(manager);
+    const cleanup = setupInteractiveControls(manager, true);
 
     try {
       const state = await manager.transfer(file.ftpPath);
@@ -73,6 +73,18 @@ export async function executeTransferQueue(
   }
   if (result.skipped.length > 0) {
     console.log(`  \x1b[33m\u2013 ${result.skipped.length} skipped\x1b[0m`);
+  }
+
+  // Wait for user acknowledgement before returning to browse
+  if (result.failed.length > 0) {
+    console.log('\nPress any key to continue...');
+    await new Promise<void>(resolve => {
+      const onKey = () => {
+        process.stdin.removeListener('data', onKey);
+        resolve();
+      };
+      process.stdin.on('data', onKey);
+    });
   }
 
   return result;
