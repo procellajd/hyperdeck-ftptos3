@@ -70,6 +70,39 @@ function askQuestion(prompt: string): Promise<string> {
   });
 }
 
+function askQuestionMasked(prompt: string): Promise<string> {
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+    const buf: string[] = [];
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+    process.stdin.setEncoding('utf8');
+    const onData = (key: string) => {
+      if (key === '\r' || key === '\n') {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdin.removeListener('data', onData);
+        process.stdout.write('\n');
+        resolve(buf.join('').trim());
+      } else if (key === '\u0003') {
+        // Ctrl+C
+        process.stdin.setRawMode(false);
+        process.exit(0);
+      } else if (key === '\u007f' || key === '\b') {
+        // Backspace
+        if (buf.length > 0) {
+          buf.pop();
+          process.stdout.write('\b \b');
+        }
+      } else if (key >= ' ') {
+        buf.push(key);
+        process.stdout.write('*');
+      }
+    };
+    process.stdin.on('data', onData);
+  });
+}
+
 const envChanges = new Map<string, string>();
 
 async function promptWithDefault(label: string, envKey: string, mask?: boolean): Promise<string> {
@@ -81,7 +114,7 @@ async function promptWithDefault(label: string, envKey: string, mask?: boolean):
   const prompt = display
     ? `${label} [${display}]: `
     : `${label}: `;
-  const answer = await askQuestion(prompt);
+  const answer = mask ? await askQuestionMasked(prompt) : await askQuestion(prompt);
   const value = answer || existing;
   if (value) process.env[envKey] = value;
   if (answer && answer !== existing) {
@@ -394,7 +427,7 @@ async function runBrowse(ftpHost?: string): Promise<void> {
       fatalExit(1);
     }
     await promptWithDefault('S3/R2 Endpoint', 'HDFS_S3_ENDPOINT');
-    await promptWithDefault('S3/R2 Access Key ID', 'HDFS_S3_ACCESS_KEY_ID');
+    await promptWithDefault('S3/R2 Access Key ID', 'HDFS_S3_ACCESS_KEY_ID', true);
     await promptWithDefault('S3/R2 Secret Access Key', 'HDFS_S3_SECRET_ACCESS_KEY', true);
   } else {
     // Local/UNC settings
