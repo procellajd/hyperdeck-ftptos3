@@ -72,34 +72,26 @@ function askQuestion(prompt: string): Promise<string> {
 
 function askQuestionMasked(prompt: string): Promise<string> {
   return new Promise((resolve) => {
+    const { Writable } = require('node:stream');
+    const muted = new Writable({ write(_c: any, _e: any, cb: () => void) { cb(); } });
+    const rl = readline.createInterface({ input: process.stdin, output: muted, terminal: true });
     process.stdout.write(prompt);
-    const buf: string[] = [];
-    process.stdin.setRawMode(true);
-    process.stdin.resume();
-    process.stdin.setEncoding('utf8');
-    const onData = (key: string) => {
-      if (key === '\r' || key === '\n') {
-        process.stdin.setRawMode(false);
-        process.stdin.pause();
-        process.stdin.removeListener('data', onData);
-        process.stdout.write('\n');
-        resolve(buf.join('').trim());
-      } else if (key === '\u0003') {
-        // Ctrl+C
-        process.stdin.setRawMode(false);
-        process.exit(0);
-      } else if (key === '\u007f' || key === '\b') {
-        // Backspace
-        if (buf.length > 0) {
-          buf.pop();
-          process.stdout.write('\b \b');
-        }
-      } else if (key >= ' ') {
-        buf.push(key);
-        process.stdout.write('*');
+    let len = 0;
+    const onKeypress = (_ch: string | undefined, key: { name?: string } | undefined) => {
+      if (key?.name === 'return') return;
+      if (key?.name === 'backspace') {
+        if (len > 0) { len--; process.stdout.write('\b \b'); }
+        return;
       }
+      if (_ch && _ch >= ' ') { len++; process.stdout.write('*'); }
     };
-    process.stdin.on('data', onData);
+    process.stdin.on('keypress', onKeypress);
+    rl.question('', (answer) => {
+      process.stdin.removeListener('keypress', onKeypress);
+      rl.close();
+      process.stdout.write('\n');
+      resolve(answer.trim());
+    });
   });
 }
 

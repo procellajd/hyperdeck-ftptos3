@@ -69,7 +69,11 @@ export function loadConfig(overrides?: Partial<AppConfig>): AppConfig {
       bucket: env('HDFS_S3_BUCKET', ''),
       keyPrefix: env('HDFS_S3_KEY_PREFIX', ''),
       region: resolveRegion(env('HDFS_S3_REGION', 'us-east-1'), envOptional('HDFS_S3_ENDPOINT')),
-      endpoint: envOptional('HDFS_S3_ENDPOINT'),
+      endpoint: (() => {
+        const ep = envOptional('HDFS_S3_ENDPOINT');
+        if (ep && !/^https?:\/\//i.test(ep)) return `https://${ep}`;
+        return ep;
+      })(),
       accessKeyId: envOptional('HDFS_S3_ACCESS_KEY_ID'),
       secretAccessKey: envOptional('HDFS_S3_SECRET_ACCESS_KEY'),
       forcePathStyle: envBool('HDFS_S3_FORCE_PATH_STYLE', false),
