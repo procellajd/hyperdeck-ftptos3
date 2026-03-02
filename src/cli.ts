@@ -3,6 +3,8 @@ import { Command } from 'commander';
 import * as readline from 'node:readline';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { Writable } from 'node:stream';
 import { loadConfig } from './config.js';
 import { TransferManager } from './transfer-manager.js';
 import { HyperDeckClient, type SlotStats } from './hyperdeck-client.js';
@@ -25,18 +27,15 @@ function fatalExit(code = 1): never {
   if (process.stdin.isTTY) {
     console.error('\nPress any key to exit...');
     try {
-      process.stdin.setRawMode(true);
-      process.stdin.resume();
-      process.stdin.once('data', () => process.exit(code));
-    } catch {
-      process.exit(code);
-    }
-  } else {
-    process.exit(code);
+      // Ensure no raw-mode listeners interfere
+      process.stdin.setRawMode(false);
+      process.stdin.pause();
+    } catch {}
+    try {
+      spawnSync('cmd', ['/c', 'pause>nul'], { stdio: ['inherit', 'ignore', 'ignore'] });
+    } catch {}
   }
-  // Keep the process alive until the keypress handler fires
-  // (the 'never' return type is satisfied by process.exit above for non-TTY)
-  return undefined as never;
+  process.exit(code);
 }
 
 // Safety net: catch any truly unhandled errors so the process never silently exits
@@ -72,7 +71,6 @@ function askQuestion(prompt: string): Promise<string> {
 
 function askQuestionMasked(prompt: string): Promise<string> {
   return new Promise((resolve) => {
-    const { Writable } = require('node:stream');
     const muted = new Writable({ write(_c: any, _e: any, cb: () => void) { cb(); } });
     const rl = readline.createInterface({ input: process.stdin, output: muted, terminal: true });
     process.stdout.write(prompt);
