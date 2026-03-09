@@ -1,18 +1,18 @@
 #!/usr/bin/env node
 import { Command } from 'commander';
 import * as readline from 'node:readline';
-import { readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, accessSync, unlinkSync, constants as fsConstants } from 'node:fs';
+import { resolve, join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { Writable } from 'node:stream';
-import { loadConfig } from './config.js';
+import { loadConfig, CONFIG_FIELDS } from './config.js';
 import { TransferManager } from './transfer-manager.js';
 import { HyperDeckClient, type SlotStats } from './hyperdeck-client.js';
 import { FtpClient } from './ftp-client.js';
 import { StateManager } from './state-manager.js';
 import { discoverFiles } from './file-browser.js';
 import { interactiveSelect } from './interactive-select.js';
-import { executeTransferQueue } from './transfer-queue.js';
+import { executeTransferQueue, QUEUE_MANIFEST_FILE, type QueueManifest } from './transfer-queue.js';
 import { log, logToFile } from './logger.js';
 import type { BrowseEntry } from './file-browser.js';
 import { S3Client, HeadBucketCommand } from '@aws-sdk/client-s3';
@@ -463,6 +463,39 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     }
   }
 
+  // Check for interrupted queue
+  const manifestPath = join(config.stateDir, QUEUE_MANIFEST_FILE);
+  if (existsSync(manifestPath)) {
+    try {
+      const raw = readFileSync(manifestPath, 'utf-8');
+      const manifest: QueueManifest = JSON.parse(raw);
+      const pending = manifest.entries.filter(e => e.status === 'pending');
+      if (pending.length > 0) {
+        console.log(`\nFound interrupted queue: ${pending.length} of ${manifest.entries.length} file(s) remaining`);
+        for (const e of pending) console.log(`  - ${e.name}`);
+        const answer = await askQuestion('\nResume this queue? (y/N): ');
+        if (answer.toLowerCase() === 'y') {
+          const browseEntries: BrowseEntry[] = pending.map(e => ({
+            ftpPath: e.ftpPath,
+            name: e.name,
+            slot: e.slot,
+            size: e.size,
+            uploadStatus: 'not_uploaded' as const,
+          }));
+          await executeTransferQueue(browseEntries, config);
+        } else {
+          unlinkSync(manifestPath);
+        }
+      } else {
+        // All entries done — clean up stale manifest
+        unlinkSync(manifestPath);
+      }
+    } catch {
+      // Corrupt manifest — remove it
+      try { unlinkSync(manifestPath); } catch {}
+    }
+  }
+
   let entries;
   let skipDestinationCheck = false;
   while (true) {
@@ -562,6 +595,34 @@ async function runBrowse(ftpHost?: string): Promise<void> {
     await executeTransferQueue(result.selected, config);
     continue;
   }
+}
+
+function printConfigSummary(): void {
+  console.log('\n--- Current Configuration ---\n');
+  let currentSection = '';
+
+  for (const field of CONFIG_FIELDS) {
+    if (field.section !== currentSection) {
+      currentSection = field.section;
+      console.log(`\n  [${currentSection}]`);
+    }
+
+    const raw = process.env[field.envVar];
+    const isSet = raw !== undefined && raw !== '';
+    let display: string;
+    if (!isSet) {
+      display = `\x1b[2m${field.defaultValue}\x1b[0m`;
+    } else if (field.envVar.includes('SECRET') || field.envVar.includes('PASSWORD')) {
+      display = raw.length > 4 ? '****' + raw.slice(-4) : '****';
+    } else {
+      display = raw;
+    }
+
+    const marker = isSet ? ' ' : '*';
+    console.log(`  ${marker} ${field.envVar.padEnd(30)} ${display.padEnd(25)} ${field.description}`);
+  }
+
+  console.log('\n  * = using default value\n');
 }
 
 const program = new Command();
@@ -814,6 +875,144 @@ program
   .description('Interactive file browser — discover, select, and queue transfers')
   .action(async () => {
     await runBrowse();
+  });
+
+program
+  .command('config')
+  .description('Show all configuration settings and their current values')
+  .action(() => {
+    printConfigSummary();
+  });
+
+program
+  .command('check')
+  .description('Verify configuration and test connectivity')
+  .action(async () => {
+    let config;
+    try {
+      config = loadConfig();
+    } catch (err) {
+      console.error(`Configuration error: ${(err as Error).message}`);
+      console.error('Run "record2s3 config" to see current settings.');
+      fatalExit(1);
+    }
+
+    printConfigSummary();
+    console.log('--- Connectivity Checks ---\n');
+    let allOk = true;
+
+    // FTP
+    process.stdout.write(`  FTP ${config.ftp.host}:${config.ftp.port}... `);
+    try {
+      const ftpClient = new FtpClient(config.ftp);
+      await ftpClient.connect();
+      const items = await ftpClient.list('/');
+      ftpClient.close();
+      console.log(`\x1b[32mOK\x1b[0m (${items.length} items in root)`);
+    } catch (err) {
+      console.log(`\x1b[31mFAILED\x1b[0m: ${(err as Error).message}`);
+      allOk = false;
+    }
+
+    // Destination
+    if (config.destination === 's3') {
+      process.stdout.write(`  S3 s3://${config.s3.bucket}... `);
+      let s3: S3Client | undefined;
+      try {
+        s3 = new S3Client({
+          region: config.s3.region,
+          ...(config.s3.endpoint ? { endpoint: config.s3.endpoint } : {}),
+          forcePathStyle: config.s3.forcePathStyle,
+          ...(config.s3.accessKeyId && config.s3.secretAccessKey
+            ? { credentials: { accessKeyId: config.s3.accessKeyId, secretAccessKey: config.s3.secretAccessKey } }
+            : {}),
+        });
+        await s3.send(new HeadBucketCommand({ Bucket: config.s3.bucket }));
+        s3.destroy();
+        console.log('\x1b[32mOK\x1b[0m');
+      } catch (err) {
+        s3?.destroy();
+        console.log(`\x1b[31mFAILED\x1b[0m: ${(err as Error).message}`);
+        allOk = false;
+      }
+    } else {
+      const dir = config.fs?.outputDir ?? '';
+      process.stdout.write(`  Local "${dir}"... `);
+      try {
+        if (!existsSync(dir)) {
+          console.log('\x1b[31mFAILED\x1b[0m: directory does not exist');
+          allOk = false;
+        } else {
+          accessSync(dir, fsConstants.W_OK);
+          console.log('\x1b[32mOK\x1b[0m (writable)');
+        }
+      } catch {
+        console.log('\x1b[31mFAILED\x1b[0m: directory is not writable');
+        allOk = false;
+      }
+    }
+
+    // HyperDeck (optional)
+    if (config.hyperdeckHost) {
+      process.stdout.write(`  HyperDeck ${config.hyperdeckHost}:9993... `);
+      const hdClient = new HyperDeckClient(config.hyperdeckHost);
+      try {
+        await hdClient.connect();
+        const info = await hdClient.getDeviceInfo();
+        await hdClient.close();
+        console.log(`\x1b[32mOK\x1b[0m (${info.model})`);
+      } catch (err) {
+        console.log(`\x1b[31mFAILED\x1b[0m: ${(err as Error).message}`);
+        allOk = false;
+      }
+    } else {
+      console.log('  HyperDeck: \x1b[2mskipped (HDFS_HYPERDECK_HOST not set)\x1b[0m');
+    }
+
+    console.log(allOk ? '\n\x1b[32mAll checks passed.\x1b[0m' : '\n\x1b[31mSome checks failed.\x1b[0m');
+    if (!allOk) process.exitCode = 1;
+  });
+
+program
+  .command('resume-queue')
+  .description('Resume an interrupted transfer queue')
+  .action(async () => {
+    const config = loadConfig();
+    const manifestPath = join(config.stateDir, QUEUE_MANIFEST_FILE);
+
+    if (!existsSync(manifestPath)) {
+      console.log('No interrupted queue found.');
+      return;
+    }
+
+    let manifest: QueueManifest;
+    try {
+      manifest = JSON.parse(readFileSync(manifestPath, 'utf-8'));
+    } catch {
+      console.error('Queue manifest is corrupt. Removing it.');
+      try { unlinkSync(manifestPath); } catch {}
+      return;
+    }
+
+    const pending = manifest.entries.filter(e => e.status === 'pending');
+    if (pending.length === 0) {
+      console.log('Queue has no pending files. Cleaning up.');
+      try { unlinkSync(manifestPath); } catch {}
+      return;
+    }
+
+    console.log(`Resuming queue: ${pending.length} of ${manifest.entries.length} file(s) remaining\n`);
+    for (const e of pending) console.log(`  - ${e.name}`);
+    console.log('');
+
+    const browseEntries: BrowseEntry[] = pending.map(e => ({
+      ftpPath: e.ftpPath,
+      name: e.name,
+      slot: e.slot,
+      size: e.size,
+      uploadStatus: 'not_uploaded' as const,
+    }));
+    await executeTransferQueue(browseEntries, config);
   });
 
 function waitForResumeOrQuit(): Promise<'resume' | 'quit'> {

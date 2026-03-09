@@ -14,7 +14,7 @@
     "start": "node dist/cli.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "bundle": "esbuild src/cli.ts --bundle --platform=node --format=cjs --target=node22 --minify --tree-shaking=true --outfile=dist/bundle.cjs",
+    "bundle": "esbuild src/cli.ts --bundle --platform=node --format=cjs --target=node20 --minify --tree-shaking=true --outfile=dist/bundle.cjs",
     "exe": "node scripts/build-exe.js"
   },
   "dependencies": {
@@ -33,6 +33,6 @@
     "vitest": "^2.1.0"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }

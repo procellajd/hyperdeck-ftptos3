@@ -3,6 +3,46 @@ import type { AppConfig, DestinationType, FileSystemConfig } from './types.js';
 
 dotenvConfig();
 
+// ── Config field registry (used by `config` and `check` commands) ──
+export interface ConfigField {
+  envVar: string;
+  defaultValue: string;
+  description: string;
+  section: 'FTP' | 'S3' | 'Local' | 'General';
+}
+
+export const CONFIG_FIELDS: ConfigField[] = [
+  { envVar: 'HDFS_FTP_HOST',             defaultValue: '(required)',          description: 'HyperDeck IP address',         section: 'FTP' },
+  { envVar: 'HDFS_FTP_PORT',             defaultValue: '21',                  description: 'FTP port',                     section: 'FTP' },
+  { envVar: 'HDFS_FTP_USER',             defaultValue: 'anonymous',           description: 'FTP username',                 section: 'FTP' },
+  { envVar: 'HDFS_FTP_PASSWORD',         defaultValue: '(empty)',             description: 'FTP password',                 section: 'FTP' },
+  { envVar: 'HDFS_FTP_TIMEOUT',          defaultValue: '120000',              description: 'Data socket timeout (ms)',      section: 'FTP' },
+  { envVar: 'HDFS_FTP_KEEPALIVE',        defaultValue: '10000',               description: 'NOOP keepalive interval (ms)', section: 'FTP' },
+  { envVar: 'HDFS_FTP_MAX_RETRIES',      defaultValue: '5',                   description: 'FTP stream retry count',       section: 'FTP' },
+  { envVar: 'HDFS_DESTINATION',          defaultValue: 's3',                  description: 'Destination: s3 or local',     section: 'General' },
+  { envVar: 'HDFS_S3_BUCKET',            defaultValue: '(required for s3)',   description: 'S3 bucket name',               section: 'S3' },
+  { envVar: 'HDFS_S3_KEY_PREFIX',        defaultValue: '(empty)',             description: 'Object key prefix/folder',     section: 'S3' },
+  { envVar: 'HDFS_S3_REGION',            defaultValue: 'us-east-1',          description: 'S3 region',                    section: 'S3' },
+  { envVar: 'HDFS_S3_ENDPOINT',          defaultValue: '(none)',              description: 'Custom S3 endpoint URL',       section: 'S3' },
+  { envVar: 'HDFS_S3_ACCESS_KEY_ID',     defaultValue: '(credential chain)',  description: 'S3 access key ID',             section: 'S3' },
+  { envVar: 'HDFS_S3_SECRET_ACCESS_KEY', defaultValue: '(credential chain)',  description: 'S3 secret access key',         section: 'S3' },
+  { envVar: 'HDFS_S3_FORCE_PATH_STYLE',  defaultValue: 'false',              description: 'Path-style S3 URLs (B2)',      section: 'S3' },
+  { envVar: 'HDFS_S3_PART_SIZE',         defaultValue: '26214400',            description: 'Part size in bytes (25 MB)',   section: 'S3' },
+  { envVar: 'HDFS_S3_MAX_RETRIES',       defaultValue: '3',                   description: 'Retries per S3 part upload',  section: 'S3' },
+  { envVar: 'HDFS_S3_CONCURRENCY',       defaultValue: '8',                   description: 'Concurrent S3 part uploads',  section: 'S3' },
+  { envVar: 'HDFS_S3_CHECKSUM',          defaultValue: 'CRC32',              description: 'Checksum algorithm',           section: 'S3' },
+  { envVar: 'HDFS_FS_OUTPUT_DIR',        defaultValue: '(required for local)', description: 'Local/UNC output directory', section: 'Local' },
+  { envVar: 'HDFS_FS_PART_SIZE',         defaultValue: '104857600',           description: 'FS staging part size (100 MB)', section: 'Local' },
+  { envVar: 'HDFS_FS_MAX_RETRIES',       defaultValue: '3',                   description: 'Retries per part write',      section: 'Local' },
+  { envVar: 'HDFS_FS_CONCURRENCY',       defaultValue: '4',                   description: 'Concurrent part writes',      section: 'Local' },
+  { envVar: 'HDFS_HIGH_WATER_MARK',      defaultValue: '4194304',             description: 'FTP stream buffer (4 MB)',    section: 'General' },
+  { envVar: 'HDFS_STATE_DIR',            defaultValue: './state',             description: 'Transfer state directory',     section: 'General' },
+  { envVar: 'HDFS_PROGRESS_INTERVAL',    defaultValue: '5000',                description: 'Progress report interval (ms)', section: 'General' },
+  { envVar: 'HDFS_HYPERDECK_HOST',       defaultValue: '(none)',              description: 'HyperDeck IP for TCP protocol', section: 'General' },
+  { envVar: 'HDFS_LOG_LEVEL',            defaultValue: 'INFO',               description: 'Minimum log level',            section: 'General' },
+  { envVar: 'HDFS_LOG_MAX_SIZE',         defaultValue: '10485760',            description: 'Max log file size (10 MB)',    section: 'General' },
+];
+
 function env(key: string, defaultValue?: string): string {
   const value = process.env[key];
   if (value !== undefined && value !== '') return value;

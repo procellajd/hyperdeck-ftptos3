@@ -1,3 +1,6 @@
+import { writeFileSync, renameSync, unlinkSync, mkdirSync } from 'node:fs';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { TransferManager } from './transfer-manager.js';
 import { setupInteractiveControls } from './cli.js';
 import { log } from './logger.js';
@@ -11,6 +14,36 @@ export interface QueueResult {
   paused: boolean;
 }
 
+export interface QueueManifestEntry {
+  ftpPath: string;
+  name: string;
+  slot: string;
+  size: number;
+  status: 'pending' | 'completed' | 'failed' | 'skipped';
+  error?: string;
+}
+
+export interface QueueManifest {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+  entries: QueueManifestEntry[];
+}
+
+export const QUEUE_MANIFEST_FILE = 'queue-manifest.json';
+
+function saveManifest(manifest: QueueManifest, stateDir: string): void {
+  const manifestPath = join(stateDir, QUEUE_MANIFEST_FILE);
+  manifest.updatedAt = new Date().toISOString();
+  const tmp = manifestPath + '.tmp.' + Date.now();
+  writeFileSync(tmp, JSON.stringify(manifest, null, 2));
+  renameSync(tmp, manifestPath);
+}
+
+function deleteManifest(stateDir: string): void {
+  try { unlinkSync(join(stateDir, QUEUE_MANIFEST_FILE)); } catch {}
+}
+
 export async function executeTransferQueue(
   files: BrowseEntry[],
   config: AppConfig,
@@ -22,11 +55,29 @@ export async function executeTransferQueue(
     paused: false,
   };
 
+  // Persist queue manifest
+  mkdirSync(config.stateDir, { recursive: true });
+  const manifest: QueueManifest = {
+    id: randomUUID(),
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    entries: files.map(f => ({
+      ftpPath: f.ftpPath,
+      name: f.name,
+      slot: f.slot,
+      size: f.size,
+      status: 'pending' as const,
+    })),
+  };
+  saveManifest(manifest, config.stateDir);
+
   let paused = false;
 
   for (let i = 0; i < files.length; i++) {
     if (paused) {
       result.skipped.push(files[i].name);
+      manifest.entries[i].status = 'skipped';
+      saveManifest(manifest, config.stateDir);
       continue;
     }
 
@@ -43,6 +94,7 @@ export async function executeTransferQueue(
       log(`Queue [${i + 1}/${files.length}]: transfer returned status=${state.status}`);
       if (state.status === 'completed') {
         result.completed.push(file.name);
+        manifest.entries[i].status = 'completed';
       } else if (state.status === 'in_progress') {
         // Paused by user — stop queue, return to caller
         paused = true;
@@ -57,9 +109,17 @@ export async function executeTransferQueue(
       log(`Queue [${i + 1}/${files.length}]: transfer threw: ${message}`);
       console.error(`Failed: ${message}`);
       result.failed.push({ file: file.name, error: message });
+      manifest.entries[i].status = 'failed';
+      manifest.entries[i].error = message;
     } finally {
       cleanup();
+      saveManifest(manifest, config.stateDir);
     }
+  }
+
+  // Clean up manifest if fully done (no pending entries)
+  if (!result.paused && manifest.entries.every(e => e.status !== 'pending')) {
+    deleteManifest(config.stateDir);
   }
 
   // Print summary
