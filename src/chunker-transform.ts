@@ -12,7 +12,14 @@ export class ChunkerTransform extends Transform {
   private readonly partSize: number;
 
   constructor(partSize: number) {
-    super();
+    // Set readableHighWaterMark to partSize so one full chunk can buffer on the
+    // readable side without immediate backpressure (default 16 KB is far too small
+    // for multi-MB parts). writableHighWaterMark matches the typical FTP stream
+    // buffer so incoming data flows smoothly into the accumulator.
+    super({
+      readableHighWaterMark: partSize,
+      writableHighWaterMark: 4 * 1024 * 1024,
+    });
     if (partSize < 5 * 1024 * 1024) {
       throw new Error('Part size must be at least 5MB');
     }

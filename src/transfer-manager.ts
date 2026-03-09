@@ -5,6 +5,8 @@ import { FtpClient } from './ftp-client.js';
 import { S3MultipartUploader } from './s3-multipart-uploader.js';
 import { FileSystemUploader } from './fs-uploader.js';
 import { ChunkerTransform } from './chunker-transform.js';
+import { AsyncChunkQueue } from './async-chunk-queue.js';
+import type { ChunkItem } from './async-chunk-queue.js';
 import { StateManager } from './state-manager.js';
 import { ProgressReporter } from './progress-reporter.js';
 import { log } from './logger.js';
@@ -323,6 +325,7 @@ export class TransferManager {
     // Count bytes as they arrive from FTP for download speed reporting
     let downloadedBytes = startOffset;
     const counter = new Transform({
+      highWaterMark: this.config.highWaterMark,
       transform(chunk: Buffer, _encoding: string, callback: TransformCallback) {
         downloadedBytes += chunk.length;
         callback(null, chunk);
@@ -339,13 +342,20 @@ export class TransferManager {
     const inFlight = new Set<Promise<void>>();
     let pipelineError: Error | null = null;
 
+    // Pre-buffer queue: decouples FTP download from S3 upload so the HyperDeck
+    // stream keeps flowing even when all upload slots are momentarily occupied.
+    const bufferAhead = Math.min(concurrency, 4);
+    const queue = new AsyncChunkQueue(bufferAhead);
+    log(`executePipeline: concurrency=${concurrency}, bufferAhead=${bufferAhead}`);
+
     // Attach error listeners BEFORE piping so errors are captured
     // instead of becoming uncaught exceptions that silently kill the process.
     const captureError = (err: Error) => {
       if (!pipelineError) {
         log(`executePipeline: stream error captured: ${err.message}`);
         pipelineError = err;
-        // Destroy the chunker to unblock the for-await consumer
+        queue.abort(err);
+        // Destroy the chunker to unblock the producer's for-await
         if (!chunker.destroyed) chunker.destroy();
       }
     };
@@ -355,20 +365,46 @@ export class TransferManager {
 
     ftpStream.pipe(counter).pipe(chunker);
 
-    // Use for-await-of for backpressure: reads chunks as slots open up.
-    // Iterate chunker directly (Transform streams are AsyncIterable in Node.js 16+).
-    try {
-      for await (const chunk of chunker) {
+    // ── Producer: reads FTP data via chunker, computes checksums, feeds queue ──
+    const producer = (async () => {
+      try {
+        for await (const chunk of chunker) {
+          if (this.aborted || pipelineError) break;
+
+          const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          const partNumber = nextPartNumber++;
+          let checksum: string | undefined;
+          if (useChecksum) {
+            const crcBuf = Buffer.alloc(4);
+            crcBuf.writeUInt32BE(crc32(buffer), 0);
+            checksum = crcBuf.toString('base64');
+          }
+
+          await queue.push({ buffer, partNumber, checksum });
+        }
+      } catch (err) {
+        // FTP stream error or queue abort — capture and let consumer drain
+        log(`executePipeline producer: ${(err as Error).message}`);
+        if (!pipelineError) pipelineError = err as Error;
+      } finally {
+        queue.finish();
+      }
+    })();
+
+    // ── Consumer: pulls pre-buffered chunks, uploads with concurrency ──
+    const consumer = (async () => {
+      while (true) {
         if (this.aborted || pipelineError) break;
 
-        const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
-        const partNumber = nextPartNumber++;
-        let checksum: string | undefined;
-        if (useChecksum) {
-          const crcBuf = Buffer.alloc(4);
-          crcBuf.writeUInt32BE(crc32(buffer), 0);
-          checksum = crcBuf.toString('base64');
+        let item: ChunkItem | null;
+        try {
+          item = await queue.pull();
+        } catch {
+          break; // queue was aborted by producer or a failed upload
         }
+        if (item === null) break; // producer finished, queue drained
+
+        const { buffer, partNumber, checksum } = item;
 
         const task = (async () => {
           const completedPart = await uploader.uploadPart(
@@ -385,32 +421,33 @@ export class TransferManager {
         })();
 
         const tracked = task
-          .catch((err) => { pipelineError = err as Error; })
+          .catch((err) => {
+            if (!pipelineError) pipelineError = err as Error;
+            queue.abort(err as Error);
+          })
           .finally(() => { inFlight.delete(tracked); });
         inFlight.add(tracked);
 
-        // When at capacity, wait for any one upload to finish before reading the next chunk
+        // When at capacity, wait for any one upload to finish before pulling next chunk
         if (inFlight.size >= concurrency) {
           await Promise.race(inFlight);
         }
       }
-    } catch (err) {
-      // FTP stream error (e.g. data socket timeout) — capture it but
-      // still drain in-flight uploads so completed parts are saved.
-      log(`executePipeline: for-await threw: ${(err as Error).message}`);
-      pipelineError = pipelineError ?? (err as Error);
-    }
 
-    log(`executePipeline: draining ${inFlight.size} in-flight uploads`);
-    // Drain remaining in-flight uploads
-    await Promise.all(inFlight);
+      log(`executePipeline: draining ${inFlight.size} in-flight uploads`);
+      // Drain remaining in-flight uploads so completed parts are saved
+      await Promise.all(inFlight);
+    })();
+
+    // Wait for both sides to finish
+    await Promise.all([producer, consumer]);
 
     // Always flush state after drain — ensures the final batch of parts is persisted
     // regardless of how the pipeline exits (success, error, abort, pause).
     this.stateManager.flush(state);
 
     if (pipelineError) {
-      log(`executePipeline: throwing after flush: ${pipelineError.message}`);
+      log(`executePipeline: throwing after flush: ${(pipelineError as Error).message}`);
       throw pipelineError;
     }
     log(`executePipeline: finished, ${state.completedParts.length} parts, ${state.totalBytesTransferred} bytes`);

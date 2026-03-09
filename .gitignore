@@ -4,4 +4,5 @@ state/
 .env
 *.tgz
 record2s3.exe
+record2s3
 sea-prep.blob

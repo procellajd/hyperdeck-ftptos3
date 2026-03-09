@@ -36,8 +36,8 @@ export class S3MultipartUploader implements Uploader {
       requestHandler: new NodeHttpHandler({
         connectionTimeout: 5000,
         socketTimeout: 90000,
-        httpAgent: new HttpAgent({ keepAlive: true, maxSockets: 64 }),
-        httpsAgent: new HttpsAgent({ keepAlive: true, maxSockets: 64 }),
+        httpAgent: createNoDelayAgent(HttpAgent, { keepAlive: true, maxSockets: 64 }),
+        httpsAgent: createNoDelayAgent(HttpsAgent, { keepAlive: true, maxSockets: 64 }),
       }),
     });
   }
@@ -259,4 +259,28 @@ function isTransientError(err: unknown): boolean {
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
+ * Create an HTTP(S) agent that enables TCP_NODELAY on all new connections.
+ * macOS TCP defaults are more conservative than Windows; disabling Nagle's
+ * algorithm prevents small-packet delays on ACKs and TLS control frames
+ * that accumulate across concurrent uploads.
+ */
+function createNoDelayAgent<T extends HttpAgent>(
+  AgentClass: new (options: object) => T,
+  options: object,
+): T {
+  const agent = new AgentClass(options);
+  const origCreate = agent.createConnection.bind(agent);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (agent as any).createConnection = function (opts: any, callback?: any) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const socket = origCreate(opts, callback) as any;
+    if (typeof socket?.setNoDelay === 'function') {
+      socket.setNoDelay(true);
+    }
+    return socket;
+  };
+  return agent;
 }
