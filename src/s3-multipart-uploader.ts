@@ -35,7 +35,7 @@ export class S3MultipartUploader implements Uploader {
         : {}),
       requestHandler: new NodeHttpHandler({
         connectionTimeout: 5000,
-        socketTimeout: 90000,
+        socketTimeout: 45000,
         httpAgent: createNoDelayAgent(HttpAgent, { keepAlive: true, maxSockets: 64 }),
         httpsAgent: createNoDelayAgent(HttpsAgent, { keepAlive: true, maxSockets: 64 }),
       }),
@@ -73,6 +73,13 @@ export class S3MultipartUploader implements Uploader {
   ): Promise<CompletedPart> {
     let lastError: Error | undefined;
 
+    // Hard per-request timeout: prevents indefinite hangs when S3-compatible
+    // endpoints (e2, R2, B2) stall without closing the connection.
+    // socketTimeout only covers inactivity — if the endpoint trickles data,
+    // it never fires.  This caps total wall-clock time per attempt.
+    // Base 60 s + ~2 s per MB of part data.
+    const timeoutMs = 60_000 + Math.ceil(body.length / (1024 * 1024)) * 2_000;
+
     for (let attempt = 0; attempt <= this.config.maxRetries; attempt++) {
       try {
         const response = await this.client.send(
@@ -84,6 +91,7 @@ export class S3MultipartUploader implements Uploader {
             Body: body,
             ...(checksum ? { ChecksumCRC32: checksum } : {}),
           }),
+          { abortSignal: AbortSignal.timeout(timeoutMs) },
         );
 
         if (!response.ETag) {
@@ -237,6 +245,10 @@ function isTransientError(err: unknown): boolean {
     if (statusCode !== undefined) {
       return statusCode >= 500;
     }
+    // AbortSignal.timeout() throws a DOMException with name 'TimeoutError'
+    // or an AbortError depending on Node.js version / SDK wrapping.
+    const name = (err as { name?: string }).name;
+    if (name === 'AbortError' || name === 'TimeoutError') return true;
     const code = (err as { code?: string }).code;
     if (code) {
       return [
