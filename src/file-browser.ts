@@ -47,12 +47,20 @@ export async function discoverFiles(
     }
   }
 
-  // 3. Cross-reference with transfer state
+  // 3. Cross-reference with transfer state (scoped to current destination)
   const allStates = stateManager.listAll();
+  const dest = destination ?? 's3';
+  const relevantStates = allStates.filter(state => {
+    const stateDest = state.destination ?? 's3'; // backward compat: old states default to s3
+    if (stateDest !== dest) return false;
+    if (dest === 's3' && s3Config) return state.bucket === s3Config.bucket;
+    return true;
+  });
+
   const stateByFtpPath = new Map<string, TransferState>();
   const stateByFilename = new Map<string, TransferState>();
 
-  for (const state of allStates) {
+  for (const state of relevantStates) {
     stateByFtpPath.set(state.ftpPath, state);
     // Also index by filename extracted from ftpPath for transfer-all matches
     const filename = state.ftpPath.split('/').pop();
@@ -85,8 +93,6 @@ export async function discoverFiles(
   // 4. Destination fallback — check unmatched files against destination
   const unchecked = entries.filter(e => e.uploadStatus === 'not_uploaded');
   if (unchecked.length > 0 && !skipDestinationCheck) {
-    const dest = destination ?? 's3';
-
     if (dest === 'local' && fsConfig) {
       const uploader = new FileSystemUploader(fsConfig);
       try {
