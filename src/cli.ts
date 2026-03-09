@@ -630,7 +630,7 @@ const program = new Command();
 program
   .name('record2s3')
   .description('Stream files from HyperDeck FTP directly to S3-compatible or local storage')
-  .version('1.0.0')
+  .version('1.1.0')
   .action(async () => {
     await runBrowse();
   });
@@ -1122,7 +1122,7 @@ function printSplash(): void {
    P R O C E L L A
        M E D I A
 
-   record2s3 v1.0.0
+   record2s3 v1.1.0
 `);
 }
 
